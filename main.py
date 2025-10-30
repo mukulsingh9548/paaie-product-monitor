@@ -10,24 +10,25 @@ PRODUCT_URL = "https://www.costco.com/1-oz-gold-bar-pamp-suisse-lady-fortuna-ver
 EMAIL_TO   = "mukulsinghypm22@gmail.com"
 EMAIL_FROM = "mukulsinghypm22@gmail.com"
 SMTP_USER  = "mukulsinghypm22@gmail.com"
-SMTP_PASS  = os.getenv("SMTP_PASS", "PUT_YOUR_16_CHAR_APP_PASSWORD_HERE")  # <-- App Password
+SMTP_PASS  = os.getenv("SMTP_PASS", "PUT_YOUR_16_CHAR_APP_PASSWORD_HERE")  # Gmail App Password
 
-CHECK_INTERVAL = 60   # testing: 60s; stable: 1800 (30 min)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
+
+CHECK_INTERVAL = 60   # seconds
 STATE_FILE = "product_state.json"
 
 # ========== HTTP SESSION ==========
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Connection": "close",
 }
 def make_session():
     s = requests.Session()
     retry = Retry(total=7, connect=4, read=4, backoff_factor=2,
                   status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
     adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter); s.mount("http://", adapter)
+    s.mount("https://", adapter)
     return s
 session = make_session()
 TIMEOUT = (15, 60)
@@ -45,7 +46,9 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
+# ========== ALERTS ==========
 def send_email(subject, body):
+    """Send email notification"""
     if not SMTP_PASS or "PUT_YOUR_16_CHAR_APP_PASSWORD_HERE" in SMTP_PASS:
         print("⚠️ Set SMTP_PASS to your Gmail App Password before running.")
         return
@@ -56,61 +59,82 @@ def send_email(subject, body):
         s.send_message(msg)
     print("📩 Email sent to", EMAIL_TO)
 
+def send_telegram(message):
+    """Send Telegram message"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+        r = requests.post(url, json=data, timeout=15)
+        if r.status_code == 200:
+            print("💬 Telegram notification sent.")
+        else:
+            print(f"⚠️ Telegram error {r.status_code}: {r.text}")
+    except Exception as e:
+        print("❌ Telegram failed:", e)
+
+def notify_all(subject, text):
+    """Send both email & Telegram alerts"""
+    send_email(subject, text)
+    send_telegram(f"{subject}\n\n{text}")
+
 # ========== SCRAPER ==========
 def get_product_info():
     print("➡️  Fetching Costco page…")
     r = session.get(PRODUCT_URL, headers=HEADERS, timeout=TIMEOUT)
-    print("✅ Response:", r.status_code, "| Size:", len(r.content))
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    # --- quantity detection (best-effort) ---
+    # --- quantity detection ---
     m = re.search(r"(?:Qty|Quantity)\s*[:\-]?\s*(\d+)", text, flags=re.I)
     qty = int(m.group(1)) if m else None
 
     # --- stock detection ---
     in_stock = any(x in text for x in ["Add to Cart", "In Stock", "Add to Cart Online"])
+
     print("📊 Parsed -> Qty:", qty, "| In stock:", in_stock)
     return qty, in_stock
 
-# ========== (OPTIONAL) one-time SMTP test ==========
-# send_email("Test ✅", "SMTP working. Alerts will be sent on quantity increase or when back in stock.")
-
 # ========== MONITOR LOOP ==========
-print("🚀 Costco Product Monitor started...")
+def main():
+    print("🚀 Product Monitor started...")
+    while True:
+        try:
+            qty, in_stock = get_product_info()
+            state = load_state()
+            last_qty   = state.get("qty")
+            last_stock = state.get("in_stock")
 
-while True:
-    try:
-        qty, in_stock = get_product_info()
+            print(f"Current Qty: {qty} | Last Qty: {last_qty} | In stock: {in_stock}")
 
-        state = load_state()
-        last_qty   = state.get("qty")
-        last_stock = state.get("in_stock")
+            # --- Quantity increased ---
+            if qty is not None and (last_qty is None or qty > last_qty):
+                notify_all("🔔 Quantity Increased!",
+                           f"Quantity increased from {last_qty} → {qty}\n{PRODUCT_URL}")
 
-        print(f"Current Qty: {qty} | Last Qty: {last_qty} | In stock: {in_stock}")
+            # --- Back in stock ---
+            if in_stock and (last_stock in (None, False)):
+                notify_all("🟢 Product Back in Stock!",
+                           f"The product appears available now.\n{PRODUCT_URL}")
 
-        # --- Quantity increased (or first time we saw a number) ---
-        if qty is not None and (last_qty is None or qty > last_qty):
-            send_email("🔔 Quantity Increased!",
-                       f"Quantity increased from {last_qty} → {qty}\n{PRODUCT_URL}")
+            # --- Out of stock or zero quantity ---
+            if (qty == 0 or not in_stock) and (last_stock not in (False, None) or (last_qty is not None and last_qty != 0)):
+                notify_all("🔴 Product Out of Stock!",
+                           f"The product is out of stock or quantity is now 0.\n{PRODUCT_URL}")
 
-        # --- Back in stock (first ever or OOS -> IN) ---
-        if in_stock and (last_stock in (None, False)):
-            send_email("🟢 Product Back in Stock!",
-                       f"The product appears available now.\n{PRODUCT_URL}")
+            # save state
+            state["qty"] = qty
+            state["in_stock"] = in_stock
+            save_state(state)
 
-        # save state
-        state["qty"] = qty
-        state["in_stock"] = in_stock
-        save_state(state)
+        except Exception as e:
+            print("⚠️ Error:", e)
 
-    except requests.exceptions.Timeout:
-        print("⏳ Timeout – will retry next cycle.")
-    except requests.exceptions.RequestException as e:
-        print("⚠️ Network error:", e)
-    except Exception as e:
-        print("❌ Other error:", e)
+        time.sleep(CHECK_INTERVAL)
 
-    time.sleep(CHECK_INTERVAL)
+if __name__ == "__main__":
+    main()
