@@ -4,4 +4,3 @@ gunicorn
 Flask
 beautifulsoup4
 lxml
-
