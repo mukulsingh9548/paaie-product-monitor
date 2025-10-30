@@ -82,7 +82,7 @@ def notify_all(subject, text):
 
 # ========== SCRAPER ==========
 def get_product_info():
-    print("➡️  Fetching Paai page…")
+    print("➡️  Fetching Paaie page…")
     r = session.get(PRODUCT_URL, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
 
