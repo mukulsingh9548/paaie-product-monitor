@@ -82,19 +82,23 @@ def notify_all(subject, text):
 
 # ========== SCRAPER ==========
 def get_product_info():
-    print("➡️  Fetching Paaie page…")
-    r = session.get(PRODUCT_URL, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
+    print("➡️  Fetching Paaie product page…")
+    try:
+        r = session.get(PRODUCT_URL, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+    except Exception as e:
+        print("⚠️ Network error while fetching product:", e)
+        return None, None
 
     soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
+    text = soup.get_text(" ", strip=True).lower()
 
-    # --- quantity detection ---
-    m = re.search(r"(?:Qty|Quantity)\s*[:\-]?\s*(\d+)", text, flags=re.I)
+    # --- detect quantity phrases like "hurry, only 4 left" ---
+    m = re.search(r"only\s+(\d+)\s+left", text)
     qty = int(m.group(1)) if m else None
 
-    # --- stock detection ---
-    in_stock = any(x in text for x in ["Add to Cart", "In Stock", "Add to Cart Online"])
+    # --- detect stock availability ---
+    in_stock = "in stock" in text or "add to cart" in text
 
     print("📊 Parsed -> Qty:", qty, "| In stock:", in_stock)
     return qty, in_stock
