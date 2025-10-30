@@ -5,15 +5,15 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ========== CONFIG ==========
-PRODUCT_URL = "https://www.costco.com/1-oz-gold-bar-pamp-suisse-lady-fortuna-veriscan-new-in-assay.product.4000186760.html"
+PRODUCT_URL = "https://www.paaie.com/products/24-kt-5-gram-fortuna-pamp-gold-bar-testing"
 
 EMAIL_TO   = "mukulsinghypm22@gmail.com"
 EMAIL_FROM = "mukulsinghypm22@gmail.com"
 SMTP_USER  = "mukulsinghypm22@gmail.com"
-SMTP_PASS  = os.getenv("SMTP_PASS", "PUT_YOUR_16_CHAR_APP_PASSWORD_HERE")  # Gmail App Password
+SMTP_PASS  = os.getenv("SMTP_PASS", "lmcferkpowyayiyc")  # Gmail App Password
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8333104134:AAFGZ-0RoSMCded4h0tPRu7NvwWQuZPOams")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5042966410")
 
 CHECK_INTERVAL = 60   # seconds
 STATE_FILE = "product_state.json"
@@ -82,7 +82,7 @@ def notify_all(subject, text):
 
 # ========== SCRAPER ==========
 def get_product_info():
-    print("➡️  Fetching Costco page…")
+    print("➡️  Fetching Paai page…")
     r = session.get(PRODUCT_URL, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
 
