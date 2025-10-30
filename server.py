@@ -9,10 +9,9 @@ _started = False
 def start_monitor_once():
     global _started
     if not _started:
-        # Import here so any heavy/env-reading code runs in the background thread,
-        # not at app import time.
-        import main as monitor_main
-        t = threading.Thread(target=monitor_main.main, daemon=True)
+        # ⬇️ import yahin par, taa ki module import time pe crash na ho
+        import main
+        t = threading.Thread(target=main.main, daemon=True)
         t.start()
         _started = True
 
