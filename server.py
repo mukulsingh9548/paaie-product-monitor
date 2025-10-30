@@ -1,17 +1,18 @@
 # server.py
-import os
 import threading
 from flask import Flask
-
-import main  # main.py me jo main() infinite loop hai
 
 app = Flask(__name__)
 
 _started = False
+
 def start_monitor_once():
     global _started
     if not _started:
-        t = threading.Thread(target=main.main, daemon=True)
+        # Import here so any heavy/env-reading code runs in the background thread,
+        # not at app import time.
+        import main as monitor_main
+        t = threading.Thread(target=monitor_main.main, daemon=True)
         t.start()
         _started = True
 
