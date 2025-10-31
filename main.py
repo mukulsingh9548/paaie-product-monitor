@@ -41,25 +41,34 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# ===================== HTTP session with retry =====================
+# ===================== HTTP session with retry (urllib3 v1/v2 safe) =====================
 def make_session():
     s = requests.Session()
-    retry = Retry(
+    # Compatibility for urllib3 v1 (method_whitelist) and v2 (allowed_methods)
+    retry_kwargs = dict(
         total=7, connect=4, read=4,
         backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    try:
+        retry = Retry(allowed_methods=["GET"], **retry_kwargs)  # urllib3 >= 1.26
+    except TypeError:
+        retry = Retry(method_whitelist=["GET"], **retry_kwargs)  # older urllib3
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
     return s
 
 session = make_session()
 
 # ===================== STATE =====================
+def _state_dir():
+    d = os.path.dirname(STATE_FILE) or "."
+    return d
+
 def load_state() -> dict:
     try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        os.makedirs(_state_dir(), exist_ok=True)
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -68,14 +77,14 @@ def load_state() -> dict:
     return {"qty": None, "in_stock": None}
 
 def save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    os.makedirs(_state_dir(), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 # ===================== NOTIFIERS =====================
 def send_email(subject: str, body: str) -> None:
     if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
-        print("✉️  Email not configured; skipping")
+        print("Email not configured; skipping")
         return
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
@@ -86,21 +95,21 @@ def send_email(subject: str, body: str) -> None:
         s.starttls(context=ctx)
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(msg["From"], [EMAIL_TO], msg.as_string())
-    print(f"📧  Email sent to {EMAIL_TO}")
+    print(f"Email sent → {EMAIL_TO}")
 
 def send_telegram(text: str) -> None:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        print("💬 Telegram not configured; skipping")
+        print("Telegram not configured; skipping")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
         if r.status_code == 200:
-            print("💬 Telegram notification sent.")
+            print("Telegram sent")
         else:
-            print(f"⚠️ Telegram error {r.status_code}: {r.text[:200]}")
+            print(f"Telegram error {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print("❌ Telegram failed:", e)
+        print("Telegram failed:", e)
 
 def notify(title: str, old_qty, new_qty, in_stock: bool) -> None:
     lines = [
@@ -155,12 +164,13 @@ def try_shopify_json(product_url: str):
             available = any(v.get("available") for v in variants)
             return None, bool(available)
     except Exception as e:
-        print("⚠️ JSON route failed:", e)
+        print("JSON route failed:", e)
         return None, None
 
 def parse_html_quantity(html: str):
+    # Strip tags → normalize whitespace → lowercase for robust matching
     text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
     qty = None
     for pat in QTY_PATTERNS:
         m = pat.search(text)
@@ -170,7 +180,9 @@ def parse_html_quantity(html: str):
                 break
             except Exception:
                 pass
-    in_stock = any(s in text for s in ["In Stock", "Add to Cart", "ADD TO CART", "Buy now", "BUY NOW"])
+    # Robust stock hint detection (lowercased)
+    stock_hints = ("in stock", "add to cart", "buy now", "add to bag", "checkout")
+    in_stock = any(s in text for s in stock_hints)
     return qty, in_stock
 
 def get_quantity_and_stock(product_url: str):
@@ -179,38 +191,40 @@ def get_quantity_and_stock(product_url: str):
     if qty is not None or in_stock is not None:
         return qty, in_stock
     # 2) HTML fallback
-    print("🔍 Falling back to HTML parsing…")
+    print("Falling back to HTML parsing…")
     r = session.get(product_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     return parse_html_quantity(r.text)
 
 # ===================== MONITOR LOOP =====================
 def main():
-    print("🚀 Paaie product monitor started…")
-    print(f"🔗 URL: {PRODUCT_URL}")
+    print("Paaie product monitor started…")
+    print(f"URL: {PRODUCT_URL}")
     state = load_state()
     prev_qty   = state.get("qty")
     prev_stock = state.get("in_stock")
-    print(f"🧠 Last state → qty: {prev_qty} | in_stock: {prev_stock}")
+    print(f"Last state → qty: {prev_qty} | in_stock: {prev_stock}")
 
-    # First observation notify? (enable if you want)
+    # First observation notify? (1=yes, 0=no)
     first_notify = os.getenv("FIRST_NOTIFY", "1") == "1"
 
     while True:
         try:
             qty, in_stock = get_quantity_and_stock(PRODUCT_URL)
-            print(f"📊 Now → qty: {qty} | in_stock: {in_stock} | last qty: {prev_qty} | last stock: {prev_stock}")
+            print(f"Now → qty: {qty} | in_stock: {in_stock} | last qty: {prev_qty} | last stock: {prev_stock}")
 
             # Decide one notification per change
             if prev_qty is None and first_notify and (qty is not None or in_stock is not None):
                 title = "Initial quantity observed" if (qty is not None) else "Initial stock observed"
                 notify(title, None, qty, bool(in_stock))
+
             elif qty is not None and qty != prev_qty:
                 # Quantity changed → single alert
                 title = "Product is OUT OF STOCK" if qty == 0 else "Product quantity updated"
                 notify(title, prev_qty, qty, qty > 0)
+
             elif in_stock is not None and prev_stock is not None and in_stock != prev_stock:
-                # Stock toggled without qty parse (rare)
+                # Stock toggled without qty parse (rare but covered)
                 if in_stock:
                     notify("Product Back in Stock", prev_qty, qty, True)
                 else:
@@ -221,12 +235,12 @@ def main():
             save_state({"qty": prev_qty, "in_stock": prev_stock})
 
         except requests.exceptions.RequestException as e:
-            print("🌐 Network error:", e)
+            print("Network error:", e)
         except Exception as e:
-            print("❌ Error:", e)
+            print("Error:", e)
 
         # polite sleep with tiny jitter
-        time.sleep(CHECK_INTERVAL + random.uniform(-3, 3))
+        time.sleep(max(10, CHECK_INTERVAL + random.uniform(-3, 3)))
 
 if __name__ == "__main__":
     main()
