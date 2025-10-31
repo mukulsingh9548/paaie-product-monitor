@@ -1,158 +1,117 @@
-import os, re, time, json, smtplib
-import requests
+# ==== QUANTITY WATCHER (scrape "Hurry, Only X left!") ====
+import os, re, time, json, random, smtplib, ssl, requests
 from email.mime.text import MIMEText
-from urllib.parse import urlparse
+from threading import Thread
 
-# ===================== USER CONFIG =====================
-PRODUCT_URL = "https://www.paaie.com/products/1-gram-fortuna-pamp-gold-bar?_pos=2&_sid=34ee79695&_ss=r"
+PRODUCT_URL = os.getenv("PRODUCT_URL", "https://www.paaie.com/products/24-kt-5-gram-fortuna-pamp-gold-bar-testing")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
+USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0")
 
-EMAIL_TO   = "mukulsinghypm22@gmail.com"
-EMAIL_FROM = "mukulsinghypm22@gmail.com"
-SMTP_USER  = "mukulsinghypm22@gmail.com"
-SMTP_PASS  = os.getenv("SMTP_PASS", "PUT_YOUR_16_CHAR_APP_PASSWORD_HERE")  # <-- App Password (16 chars)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = 60          # seconds (testing)
-STATE_FILE     = "paaie_state.json"
-TIMEOUT        = (15, 60)    # (connect, read)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+EMAIL_TO  = os.getenv("EMAIL_TO")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER or "")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+STATE_FILE = os.getenv("STATE_FILE", "/data/scrape_state.json")
 
-# ===================== HELPERS =====================
-def send_email(subject: str, body: str) -> None:
-    if not SMTP_PASS or "PUT_YOUR_16_CHAR_APP_PASSWORD_HERE" in SMTP_PASS:
-        print("⚠️  Please set SMTP_PASS to your Gmail App Password.")
-        return
+QTY_PATTERNS = [
+    re.compile(r"Hurry[^0-9]{0,20}(\d+)\s*(?:left|remaining)", re.I),
+    re.compile(r"Only\s*(\d+)\s*left", re.I),
+    re.compile(r"\b(\d+)\s*left\b", re.I),
+]
+
+def _debug(msg): print(f"[QWATCH] {msg}", flush=True)
+
+def _load_state():
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        if os.path.exists(STATE_FILE):
+            return json.load(open(STATE_FILE, "r", encoding="utf-8"))
+    except Exception as e:
+        _debug(f"state load error: {e!r}")
+    return {"qty": None}
+
+def _save_state(qty):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        json.dump({"qty": qty}, open(STATE_FILE, "w", encoding="utf-8"))
+    except Exception as e:
+        _debug(f"state save error: {e!r}")
+
+def _send_email(subject, body):
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_TO):
+        _debug("email not configured; skip"); return
     msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = EMAIL_TO
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
-    print(f"📧  Email sent to {EMAIL_TO}")
+    msg["Subject"], msg["From"], msg["To"] = subject, (EMAIL_FROM or SMTP_USER), EMAIL_TO
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.starttls(context=ctx); s.login(SMTP_USER, SMTP_PASS); s.sendmail(msg["From"], [EMAIL_TO], msg.as_string())
 
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def _send_telegram(text):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        _debug("telegram not configured; skip"); return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for _ in range(3):
+        try:
+            r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+            if r.status_code == 200: return
+        except requests.RequestException: pass
+        time.sleep(2)
 
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+def _notify(title, old_qty, new_qty):
+    status = "IN STOCK ✅" if (new_qty or 0) > 0 else "OUT OF STOCK ⛔"
+    body = "\n".join([title, f"URL: {PRODUCT_URL}", f"Quantity: {old_qty} → {new_qty}", f"Status: {status}"])
+    _send_email(f"[Paaie] {title}", body); _send_telegram(body)
 
-def extract_shopify_handle(product_url: str) -> tuple[str, str]:
-    """
-    Returns (base_url, handle)
-    e.g. https://www.paaie.com/products/1-gram...  -> ("https://www.paaie.com", "1-gram-fortuna-pamp-gold-bar")
-    """
-    u = urlparse(product_url)
-    base = f"{u.scheme}://{u.netloc}"
-    m = re.search(r"/products/([^/?#]+)", u.path)
-    if not m:
-        raise ValueError("Product handle not found in URL")
-    handle = m.group(1)
-    return base, handle
+def _fetch_html():
+    headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
+    last_exc = None
+    for a in range(1, 6):
+        try:
+            r = requests.get(PRODUCT_URL, headers=headers, timeout=15)
+            if r.status_code == 200: return r.text
+            _debug(f"HTTP {r.status_code}")
+        except requests.RequestException as e:
+            last_exc = e; _debug(f"net err: {e!r}")
+        time.sleep(min(12, 2**a) + random.uniform(0, 0.8))
+    raise RuntimeError(f"fetch failed: {last_exc!r}")
 
-def get_quantity_from_shopify(product_url: str) -> tuple[int | None, bool]:
-    """
-    Try Shopify JSON; if blocked, fall back to parsing HTML like "Hurry, Only 6 left!".
-    Returns: (qty, in_stock)
-    """
-    base, handle = extract_shopify_handle(product_url)
+def _extract_qty(html: str):
+    text = re.sub(r"<[^>]+>", " ", html); text = re.sub(r"\s+", " ", text)
+    for pat in QTY_PATTERNS:
+        m = pat.search(text)
+        if m:
+            try: return int(m.group(1))
+            except Exception: pass
+    return None
 
-    # 1) JSON route (may be blocked by store)
-    try:
-        p_res = requests.get(f"{base}/products/{handle}.js", headers=HEADERS, timeout=TIMEOUT)
-        p_res.raise_for_status()
-        p_json = p_res.json()
-
-        if p_json.get("variants"):
-            # choose first available, else first
-            variant = None
-            for v in p_json["variants"]:
-                variant = v
-                if v.get("available"):
-                    break
-            variant_id = variant["id"]
-
-            v_res = requests.get(f"{base}/variants/{variant_id}.json", headers=HEADERS, timeout=TIMEOUT)
-            if v_res.status_code == 200:
-                v_json = v_res.json().get("variant", {})
-                qty = v_json.get("inventory_quantity")
-                available = bool(v_json.get("available", False))
-                if isinstance(qty, int) and qty < 0:
-                    qty = 0
-                if qty is not None:
-                    return qty, available
+def _quantity_loop():
+    _debug("started")
+    st = _load_state(); prev = st.get("qty")
+    _debug(f"initial qty: {prev}")
+    FIRST_NOTIFY = os.getenv("FIRST_NOTIFY", "1") == "1"
+    while True:
+        try:
+            qty = _extract_qty(_fetch_html())
+            if qty is None: _debug("pattern not found")
             else:
-                # product.js 'available' (only boolean)
-                available = any(v.get("available") for v in p_json["variants"])
-                # keep qty None; we’ll still email on back-in-stock
-                if available:
-                    return None, True
-    except Exception as e:
-        print("⚠️ JSON API failed:", e)
+                if prev is None and FIRST_NOTIFY:
+                    _notify("Initial quantity observed", None, qty); _save_state(qty); prev = qty
+                elif qty != prev:
+                    title = "Product quantity updated" if qty > 0 else "Product is OUT OF STOCK"
+                    _notify(title, prev, qty); _save_state(qty); prev = qty
+                else: _debug("no change")
+        except Exception as e:
+            _debug(f"loop err: {e!r}")
+        time.sleep(max(10, int(POLL_SECONDS) + random.uniform(-5, 5)))
 
-    # 2) HTML fallback: parse visible text
-    print("🔍 Falling back to HTML parsing…")
-    r = requests.get(product_url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    html = r.text
-
-    # quantity like "Only 6 left", "Hurry, Only 6 left!"
-    m = re.search(r"[Hh]urry,\s*[Oo]nly\s+(\d+)\s+left|[Oo]nly\s+(\d+)\s+left", html)
-    qty = None
-    if m:
-        qty = int(next(g for g in m.groups() if g is not None))
-
-    # in-stock hints
-    in_stock = any(s in html for s in ["In Stock", "Add to Cart", "Add to cart", "Buy now", "ADD TO CART"])
-
-    print(f"📊 Parsed (HTML) → Qty: {qty} | In stock: {in_stock}")
-    return qty, in_stock
-
-# ===================== MONITOR LOOP =====================
-print("🚀 Paaie product monitor started…")
-print(f"🔗 URL: {PRODUCT_URL}")
-
-while True:
-    try:
-        qty, in_stock = get_quantity_from_shopify(PRODUCT_URL)
-
-        state = load_state()
-        last_qty   = state.get("qty")
-        last_stock = state.get("in_stock")
-
-        print(f"📊 Qty: {qty} | Last: {last_qty} | In stock: {in_stock}")
-
-        # quantity increased (or first known)
-        if qty is not None and (last_qty is None or qty > last_qty):
-            send_email(
-                "🔔 Quantity Increased!",
-                f"Quantity increased: {last_qty} → {qty}\n{PRODUCT_URL}"
-            )
-
-        # back in stock (first time or OOS -> IN)
-        if in_stock and (last_stock in (None, False)):
-            qtxt = f"Current quantity: {qty}" if qty is not None else "Now available"
-            send_email("🟢 Product Back in Stock!", f"{qtxt}\n{PRODUCT_URL}")
-
-        # persist state
-        state["qty"]      = qty
-        state["in_stock"] = in_stock
-        save_state(state)
-
-    except requests.exceptions.RequestException as e:
-        print("🌐 Network error:", e)
-    except Exception as e:
-        print("❌ Error:", e)
-
-    time.sleep(CHECK_INTERVAL)
+def start_quantity_watcher():
+    from threading import Thread
+    Thread(target=_quantity_loop, daemon=True).start()
+    _debug("thread launched")
+# ==== END QUANTITY WATCHER ==============================================
