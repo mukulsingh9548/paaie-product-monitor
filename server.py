@@ -1,41 +1,37 @@
-import threading
+import threading, signal, sys, os, requests, smtplib, ssl
 from flask import Flask, Response
-import os
-import requests
-import smtplib
-import ssl
 from email.message import EmailMessage
 
 app = Flask(__name__)
-_started = False
+_started = False  # ensure single start per process
 
-# -------------------------------------------------------------------------
-# Background thread: start monitor once
-# -------------------------------------------------------------------------
+# ------------------------------- background monitor ------------------------
 def start_monitor_once():
+    """Start product monitor only once."""
     global _started
-    if not _started:
-        try:
-            # main.py ke main() function ko thread me run karte hain
-            from main import main as monitor_main
-            t = threading.Thread(target=monitor_main, daemon=True)
-            t.start()
-            _started = True
-            print("✅ Product monitor thread started successfully.")
-        except Exception as e:
-            print(f"❌ Error starting monitor: {e}")
+    if _started:
+        return
+    try:
+        from main import main as monitor_main
+        t = threading.Thread(target=monitor_main, daemon=True)
+        t.start()
+        _started = True
+        print("✅ Product monitor thread started successfully.")
+    except Exception as e:
+        print(f"❌ Error starting monitor: {e}")
 
-# -------------------------------------------------------------------------
-# Home route
-# -------------------------------------------------------------------------
-@app.route('/')
+# ------------------------------- routes ------------------------------------
+@app.route("/")
 def index():
     start_monitor_once()
     return Response("✅ Paaie product monitor is running fine!", status=200, mimetype="text/plain")
 
-# -------------------------------------------------------------------------
-# Helper: Safe email sender (dual port + timeout)
-# -------------------------------------------------------------------------
+@app.route("/healthz")
+def healthz():
+    # make sure monitor has started for this process
+    start_monitor_once()
+    return {"ok": True}, 200
+
 def _send_email_safe(subject: str, body: str):
     smtp_user = os.environ.get("SMTP_USER")
     smtp_pass = os.environ.get("SMTP_PASS")
@@ -52,7 +48,6 @@ def _send_email_safe(subject: str, body: str):
     msg["To"] = mail_to
     msg.set_content(body)
 
-    # Try STARTTLS first (587)
     try:
         with smtplib.SMTP(host, 587, timeout=10) as s:
             s.starttls(context=ssl.create_default_context())
@@ -63,7 +58,6 @@ def _send_email_safe(subject: str, body: str):
     except Exception as e:
         print(f"[TEST_NOTIFY] 587 failed: {e}; retrying 465/SSL...")
 
-    # Fallback to SSL (465)
     try:
         with smtplib.SMTP_SSL(host, 465, context=ssl.create_default_context(), timeout=10) as s:
             s.login(smtp_user, smtp_pass)
@@ -72,13 +66,9 @@ def _send_email_safe(subject: str, body: str):
     except Exception as e2:
         print(f"[TEST_NOTIFY] ❌ Email failed on both ports: {e2}")
 
-# -------------------------------------------------------------------------
-# Test route: Sends Telegram + Email notifications
-# -------------------------------------------------------------------------
-@app.route('/_test_notify')
+@app.route("/_test_notify")
 def _test_notify():
     try:
-        # Telegram
         tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
         tg_chat  = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -93,25 +83,26 @@ def _test_notify():
         else:
             print("[TEST_NOTIFY] ⚠️ Telegram skipped (missing env vars).")
 
-        # Email test
         _send_email_safe(
             "[Paaie] TEST Notification",
             "✅ Your Paaie monitor test email works perfectly!"
         )
 
-        return Response(
-            "✅ Test notification executed (check Telegram and email).",
-            status=200,
-            mimetype="text/plain"
-        )
-
+        return Response("✅ Test notification executed (check Telegram and email).",
+                        status=200, mimetype="text/plain")
     except Exception as e:
         print(f"❌ Error in test notify: {e}")
         return Response(f"❌ Error: {e}", status=500, mimetype="text/plain")
 
-# -------------------------------------------------------------------------
-# Run Flask app
-# -------------------------------------------------------------------------
+# ------------------------------- graceful exit -----------------------------
+def _graceful_exit(*_):
+    print("🛑 Shutting down...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _graceful_exit)
+signal.signal(signal.SIGINT, _graceful_exit)
+
+# ------------------------------- local run ---------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Starting Flask server on port {port}")
