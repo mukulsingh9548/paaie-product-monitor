@@ -1,7 +1,5 @@
-requests
-python-dotenv
-gunicorn
 Flask
-beautifulsoup4
-lxml
-urllib3>=1.26.0
+gunicorn
+requests
+urllib3
+python-dotenv
