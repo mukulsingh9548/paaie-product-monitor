@@ -9,14 +9,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ===================== CONFIG (ENV) =====================
-PRODUCT_URL   = os.getenv("PRODUCT_URL", "https://www.paaie.com/products/24-kt-5-gram-fortuna-pamp-gold-bar-testing")
+PRODUCT_URL    = os.getenv("PRODUCT_URL", "https://www.paaie.com/products/24-kt-5-gram-fortuna-pamp-gold-bar-testing")
 CHECK_INTERVAL = int(os.getenv("POLL_SECONDS", "120"))
 
-# NOTE: /data may not be writable on Render free. Use local file in repo dir.
-STATE_FILE    = os.getenv("STATE_FILE", "./product_state.json")
+# NOTE: /data may not be writable on Render free. Use local file.
+STATE_FILE     = os.getenv("STATE_FILE", "./product_state.json")
 
 # (connect timeout, read timeout)
-TIMEOUT       = (15, 60)
+TIMEOUT        = (15, 60)
 
 EMAIL_TO   = os.getenv("EMAIL_TO", "prakharsharma1360@gmail.com")
 EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_TO)
@@ -44,15 +44,14 @@ def make_session():
         total=7,
         connect=4,
         read=4,
-        backoff_factor=2,                 # 0,2,4,8... seconds
+        backoff_factor=2,                  # 0,2,4,8... seconds
         status_forcelist=[429, 500, 502, 503, 504],
         raise_on_status=False,
     )
     try:
         retry = Retry(allowed_methods=["GET", "POST"], **retry_kwargs)
     except TypeError:
-        # older urllib3
-        retry = Retry(method_whitelist=["GET", "POST"], **retry_kwargs)
+        retry = Retry(method_whitelist=["GET", "POST"], **retry_kwargs)  # urllib3<1.26
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
@@ -60,7 +59,6 @@ def make_session():
 
 session = make_session()
 
-# Generic safe wrappers for GET/POST (extra guard around Session)
 def http_get(url, **kwargs):
     kwargs.setdefault("timeout", TIMEOUT)
     return session.get(url, **kwargs)
@@ -94,10 +92,40 @@ def save_state(state):
 
 # ===================== NOTIFIERS =====================
 def send_email(subject, body):
-    if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
+    """
+    Email via SendGrid HTTP API (preferred). Falls back to SMTP if SENDGRID_API_KEY not set.
+    This avoids outbound SMTP blocks on some hosts.
+    """
+    sg_key = os.getenv("SENDGRID_API_KEY")
+    recipients = [r.strip() for r in str(EMAIL_TO).split(",") if r.strip()]
+
+    # ---- SendGrid (HTTP) first ----
+    if sg_key and recipients:
+        try:
+            payload = {
+                "personalizations": [{"to": [{"email": e} for e in recipients]}],
+                "from": {"email": EMAIL_FROM or SMTP_USER},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            }
+            r = http_post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {sg_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            print(f"[email] sendgrid status: {r.status_code}")
+            # 202 == accepted
+            if 200 <= r.status_code < 300:
+                return
+            else:
+                print("[email] sendgrid non-2xx, will try SMTP fallback…")
+        except Exception as e:
+            print("[email] sendgrid error, will try SMTP fallback:", e)
+
+    # ---- SMTP fallback ----
+    if not (SMTP_USER and SMTP_PASS and recipients):
         print("[email] not configured; skipping")
         return
-    recipients = [r.strip() for r in str(EMAIL_TO).split(",") if r.strip()]
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"]    = EMAIL_FROM or SMTP_USER
@@ -107,7 +135,7 @@ def send_email(subject, body):
         s.starttls(context=ctx)
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(msg["From"], recipients, msg.as_string())
-    print(f"[email] sent → {recipients}")
+    print(f"[email] sent via SMTP → {recipients}")
 
 def send_telegram(text):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
@@ -159,7 +187,7 @@ def try_shopify_json(product_url: str):
         if not variants:
             return None, None
 
-        # Prefer first available variant, else first variant.
+        # Prefer available variant, else first variant.
         variant = next((v for v in variants if v.get("available")), variants[0])
         vid = variant["id"]
 
@@ -246,7 +274,6 @@ def main():
         except Exception as e:
             print("[loop] error:", e)
 
-        # jitter to avoid thundering herd & respect rate limits
         time.sleep(max(10, CHECK_INTERVAL + random.uniform(-3, 3)))
 
 if __name__ == "__main__":
