@@ -28,24 +28,51 @@ def index():
 
 @app.route("/healthz")
 def healthz():
-    # make sure monitor has started for this process
     start_monitor_once()
     return {"ok": True}, 200
 
+# ------------------------------- email (SendGrid first, SMTP fallback) -----
 def _send_email_safe(subject: str, body: str):
+    sg_key = os.environ.get("SENDGRID_API_KEY")
+    email_to = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
+    email_from = os.environ.get("SMTP_USER") or os.environ.get("EMAIL_FROM") or email_to
+
+    # Prefer HTTP via SendGrid to avoid outbound SMTP blocks
+    if sg_key and email_to:
+        try:
+            to_list = [e.strip() for e in str(email_to).split(",") if e.strip()]
+            payload = {
+                "personalizations": [{"to": [{"email": e} for e in to_list]}],
+                "from": {"email": email_from},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            }
+            r = requests.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {sg_key}", "Content-Type": "application/json"},
+                json=payload, timeout=10
+            )
+            print(f"[TEST_NOTIFY] Email via SendGrid: {r.status_code}")
+            if 200 <= r.status_code < 300:
+                return
+            else:
+                print("[TEST_NOTIFY] SendGrid non-2xx, trying SMTP fallback…")
+        except Exception as e:
+            print(f"[TEST_NOTIFY] SendGrid failed: {e}; trying SMTP...")
+
+    # SMTP fallback
     smtp_user = os.environ.get("SMTP_USER")
     smtp_pass = os.environ.get("SMTP_PASS")
-    mail_to   = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
     host      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 
-    if not (smtp_user and smtp_pass and mail_to):
+    if not (smtp_user and smtp_pass and email_to):
         print("[TEST_NOTIFY] ⚠️ Email skipped (missing env vars).")
         return
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = smtp_user
-    msg["To"] = mail_to
+    msg["To"] = email_to
     msg.set_content(body)
 
     try:
@@ -66,6 +93,7 @@ def _send_email_safe(subject: str, body: str):
     except Exception as e2:
         print(f"[TEST_NOTIFY] ❌ Email failed on both ports: {e2}")
 
+# ------------------------------- test route --------------------------------
 @app.route("/_test_notify")
 def _test_notify():
     try:
