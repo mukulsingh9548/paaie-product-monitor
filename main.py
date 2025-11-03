@@ -18,13 +18,18 @@ STATE_FILE     = os.getenv("STATE_FILE", "./product_state.json")
 # (connect timeout, read timeout)
 TIMEOUT        = (15, 60)
 
+# Email (SendGrid-only)
 EMAIL_TO   = os.getenv("EMAIL_TO", "prakharsharma1360@gmail.com")
-EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_TO)
+EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_TO)  # MUST match verified sender in SendGrid
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")  # SG.xxxxx...
+
+# Keep SMTP vars present but UNUSED (to avoid confusion in logs)
 SMTP_USER  = os.getenv("SMTP_USER") or EMAIL_FROM
 SMTP_PASS  = os.getenv("SMTP_PASS")
 SMTP_HOST  = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
 
+# Telegram
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -93,49 +98,36 @@ def save_state(state):
 # ===================== NOTIFIERS =====================
 def send_email(subject, body):
     """
-    Email via SendGrid HTTP API (preferred). Falls back to SMTP if SENDGRID_API_KEY not set.
-    This avoids outbound SMTP blocks on some hosts.
+    Email via SendGrid HTTP API (NO SMTP fallback).
+    This avoids outbound SMTP blocks on Render and gives clear error logs.
     """
-    sg_key = os.getenv("SENDGRID_API_KEY")
     recipients = [r.strip() for r in str(EMAIL_TO).split(",") if r.strip()]
 
-    # ---- SendGrid (HTTP) first ----
-    if sg_key and recipients:
-        try:
-            payload = {
-                "personalizations": [{"to": [{"email": e} for e in recipients]}],
-                "from": {"email": EMAIL_FROM or SMTP_USER},
-                "subject": subject,
-                "content": [{"type": "text/plain", "value": body}],
-            }
-            r = http_post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers={"Authorization": f"Bearer {sg_key}", "Content-Type": "application/json"},
-                json=payload,
-            )
-            print(f"[email] sendgrid status: {r.status_code}")
-            # 202 == accepted
-            if 200 <= r.status_code < 300:
-                return
-            else:
-                print("[email] sendgrid non-2xx, will try SMTP fallback…")
-        except Exception as e:
-            print("[email] sendgrid error, will try SMTP fallback:", e)
-
-    # ---- SMTP fallback ----
-    if not (SMTP_USER and SMTP_PASS and recipients):
-        print("[email] not configured; skipping")
+    if not (SENDGRID_API_KEY and EMAIL_FROM and recipients):
+        print("[email] skipped: missing SENDGRID_API_KEY/EMAIL_FROM/EMAIL_TO")
         return
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM or SMTP_USER
-    msg["To"]      = ", ".join(recipients)
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-        s.starttls(context=ctx)
-        s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(msg["From"], recipients, msg.as_string())
-    print(f"[email] sent via SMTP → {recipients}")
+
+    payload = {
+        "personalizations": [{"to": [{"email": e} for e in recipients]}],
+        "from": {"email": EMAIL_FROM, "name": "Paaie Product Monitor"},
+        "reply_to": {"email": EMAIL_FROM},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
+
+    try:
+        r = http_post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        if 200 <= r.status_code < 300:
+            print(f"[email] sendgrid accepted: {r.status_code}")
+        else:
+            # show exact reason from SendGrid to fix quickly
+            print(f"[email] sendgrid error: {r.status_code} body={r.text}")
+    except Exception as e:
+        print("[email] sendgrid exception:", e)
 
 def send_telegram(text):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
