@@ -27,14 +27,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEOUT = (15, 60)
 
-# >>>>>>>>>>> ADD: safe defaults so email always goes <<<<<<<<<<
-if not EMAIL_TO:
-    EMAIL_TO = "mukulsinghypm22@gmail.com"
-    if not EMAIL_FROM:
-        EMAIL_FROM = EMAIL_TO
-    if not SMTP_USER:
-        SMTP_USER = EMAIL_FROM
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# ADD: force SMTP switch (so SendGrid bypass ho)
+EMAIL_FORCE_SMTP = os.getenv("EMAIL_FORCE_SMTP", "0") == "1"
 
 # =============== HEADERS ===============
 HEADERS = {
@@ -74,7 +68,7 @@ def http_post(url, **kwargs):
     kwargs.setdefault("timeout", TIMEOUT)
     return session.post(url, **kwargs)
 
-# =============== STATE ================
+# =============== STATE ===============
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
@@ -98,12 +92,12 @@ def send_email(subject, body):
         print("[email] no recipients configured; skipping")
         return
 
-    # SendGrid HTTP (preferred)
-    if SENDGRID_API_KEY:
+    # SendGrid HTTP (preferred) — only if NOT forcing SMTP
+    if SENDGRID_API_KEY and not EMAIL_FORCE_SMTP:
         try:
             payload = {
                 "personalizations": [{"to": [{"email": e} for e in recipients]}],
-                "from": {"email": EMAIL_FROM},   # must be verified Single Sender
+                "from": {"email": EMAIL_FROM},   # must be verified Single Sender/domain on SendGrid
                 "subject": subject,
                 "content": [{"type": "text/plain", "value": body}],
             }
@@ -120,7 +114,7 @@ def send_email(subject, body):
         except Exception as e:
             print("[email] sendgrid error:", e)
 
-    # SMTP fallback
+    # SMTP fallback / forced SMTP
     if not (SMTP_USER and SMTP_PASS):
         print("[email] smtp not configured; skipping")
         return
@@ -146,6 +140,17 @@ def send_telegram(text):
     except Exception as e:
         print("[tg] failed:", e)
 
+# ADD: subject me emoji, Telegram style
+def _subject_for_email(title, in_stock, old_qty, new_qty):
+    t = title or "Update"
+    if "Out of Stock" in t or (in_stock is False):
+        return f"🔴 {t}!"
+    if "Back in Stock" in t or (in_stock is True and (old_qty is None or (new_qty or 0) > (old_qty or 0))):
+        return f"🟢 {t}!"
+    if "Quantity" in t:
+        return f"🔔 {t}!"
+    return t
+
 def notify(title, old_qty, new_qty, in_stock):
     body = (
         f"{title}\n\n"
@@ -153,7 +158,8 @@ def notify(title, old_qty, new_qty, in_stock):
         f"Quantity: {old_qty} → {new_qty}\n"
         f"Status: {'IN STOCK ✅' if in_stock else 'OUT OF STOCK ⛔'}"
     )
-    send_email(f"[Paaie] {title}", body)
+    subj = _subject_for_email(title, in_stock, old_qty, new_qty)
+    send_email(subj, body)
     send_telegram(body)
 
 # =============== PARSERS ===============
@@ -322,7 +328,5 @@ def main():
 
         time.sleep(CHECK_SECONDS + random.uniform(-3, 3))
 
-# >>>>>>>>>>> ADD: ensure main runs when script starts <<<<<<<<<<
 if __name__ == "__main__":
     main()
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
