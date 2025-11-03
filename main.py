@@ -27,8 +27,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEOUT = (15, 60)
 
-# ADD: force SMTP switch (so SendGrid bypass ho)
-EMAIL_FORCE_SMTP = os.getenv("EMAIL_FORCE_SMTP", "0") == "1"
+# If EMAIL_TO blank, set a safe default (so email never gets skipped accidentally)
+if not EMAIL_TO:
+    EMAIL_TO = "mukulsinghypm22@gmail.com"
+    if not EMAIL_FROM:
+        EMAIL_FROM = EMAIL_TO
+    if not SMTP_USER:
+        SMTP_USER = EMAIL_FROM
 
 # =============== HEADERS ===============
 HEADERS = {
@@ -92,12 +97,28 @@ def send_email(subject, body):
         print("[email] no recipients configured; skipping")
         return
 
-    # SendGrid HTTP (preferred) — only if NOT forcing SMTP
-    if SENDGRID_API_KEY and not EMAIL_FORCE_SMTP:
+    # PREFER SMTP if configured (Gmail App Password etc); else SendGrid
+    if SMTP_USER and SMTP_PASS:
+        try:
+            msg = MIMEText(body, "plain", "utf-8")
+            msg["Subject"] = subject
+            msg["From"]    = EMAIL_FROM
+            msg["To"]      = ", ".join(recipients)
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+                s.starttls(context=ctx)
+                s.login(SMTP_USER, SMTP_PASS)
+                s.sendmail(msg["From"], recipients, msg.as_string())
+            print(f"[email] sent via SMTP → {recipients}")
+            return
+        except Exception as e:
+            print("[email] smtp error:", e)
+
+    if SENDGRID_API_KEY:
         try:
             payload = {
                 "personalizations": [{"to": [{"email": e} for e in recipients]}],
-                "from": {"email": EMAIL_FROM},   # must be verified Single Sender/domain on SendGrid
+                "from": {"email": EMAIL_FROM},   # must be verified Single Sender/domain
                 "subject": subject,
                 "content": [{"type": "text/plain", "value": body}],
             }
@@ -107,27 +128,11 @@ def send_email(subject, body):
                 json=payload,
             )
             print(f"[email] sendgrid status: {r.status_code}")
-            if 200 <= r.status_code < 300:
-                return
-            else:
-                print(f"[email] sendgrid non-2xx: {r.status_code} {r.text[:200]}")
+            return
         except Exception as e:
             print("[email] sendgrid error:", e)
 
-    # SMTP fallback / forced SMTP
-    if not (SMTP_USER and SMTP_PASS):
-        print("[email] smtp not configured; skipping")
-        return
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = ", ".join(recipients)
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-        s.starttls(context=ctx)
-        s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(msg["From"], recipients, msg.as_string())
-    print(f"[email] sent via SMTP → {recipients}")
+    print("[email] no working email transport; skipped")
 
 def send_telegram(text):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
@@ -140,12 +145,11 @@ def send_telegram(text):
     except Exception as e:
         print("[tg] failed:", e)
 
-# ADD: subject me emoji, Telegram style
-def _subject_for_email(title, in_stock, old_qty, new_qty):
+def subject_for_email(title, in_stock, old_qty, new_qty):
     t = title or "Update"
-    if "Out of Stock" in t or (in_stock is False):
+    if "Out of Stock" in t or in_stock is False:
         return f"🔴 {t}!"
-    if "Back in Stock" in t or (in_stock is True and (old_qty is None or (new_qty or 0) > (old_qty or 0))):
+    if "Back in Stock" in t or in_stock is True:
         return f"🟢 {t}!"
     if "Quantity" in t:
         return f"🔔 {t}!"
@@ -158,14 +162,18 @@ def notify(title, old_qty, new_qty, in_stock):
         f"Quantity: {old_qty} → {new_qty}\n"
         f"Status: {'IN STOCK ✅' if in_stock else 'OUT OF STOCK ⛔'}"
     )
-    subj = _subject_for_email(title, in_stock, old_qty, new_qty)
-    send_email(subj, body)
+    send_email(subject_for_email(title, in_stock, old_qty, new_qty), body)
     send_telegram(body)
 
 # =============== PARSERS ===============
 HURRY_PATTERNS = [
-    re.compile(r"\bHurry[^0-9]{0,20}(\d+)\s*(?:left|remain)", re.I),
-    re.compile(r"\bOnly\s*(\d+)\s*left\b", re.I),
+    re.compile(r"\bHurry[^0-9]{0,40}(\d{1,3}(?:,\d{3})*)\s*(?:left|remain(?:ing)?)", re.I),
+    re.compile(r"\bOnly[^0-9]{0,20}(\d{1,3}(?:,\d{3})*)\s*left\b", re.I),
+]
+SOLD_PATTERNS = [
+    re.compile(r"\bsold\s*out\b", re.I),
+    re.compile(r"\bout\s*of\s*stock\b", re.I),
+    re.compile(r"\bcurrently\s*unavailable\b", re.I),
 ]
 
 def extract_shopify_handle(product_url: str):
@@ -225,18 +233,29 @@ def cart_probe_qty(product_url: str, variant_id: int):
     return None
 
 def parse_html_hurry(html: str):
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text)
+    # Strip scripts/styles and tags
+    s = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.S|re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"&nbsp;", " ", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # “Only X left / Hurry X left”
     for pat in HURRY_PATTERNS:
-        m = pat.search(text)
+        m = pat.search(s)
         if m:
             try:
-                return int(m.group(1))
+                q = int(m.group(1).replace(",", ""))
+                return q, (q > 0)
             except Exception:
                 pass
-    # stock hint
-    in_stock = "in stock" in text.lower()
-    return None, in_stock
+
+    # Sold out hints
+    if any(p.search(s) for p in SOLD_PATTERNS):
+        return 0, False
+
+    # Generic hints
+    in_stock = "add to cart" in s.lower() or "in stock" in s.lower()
+    return None, (True if in_stock else None)
 
 def get_quantity_and_stock(product_url: str):
     # 1) variant.json
@@ -256,21 +275,14 @@ def get_quantity_and_stock(product_url: str):
         if isinstance(q2, int):
             return q2, q2 > 0
 
-    # 3) HTML fallback for “Hurry, Only X left!”
+    # 3) HTML fallback (Hurry/Only X left OR Sold out)
     print("[route:html] fallback…")
     r = http_get(product_url, headers=HEADERS, allow_redirects=True)
     r.raise_for_status()
-    h = r.text
-    for pat in HURRY_PATTERNS:
-        m = pat.search(h)
-        if m:
-            try:
-                q = int(m.group(1))
-                return q, q > 0
-            except Exception:
-                pass
-    # last resort: simple in-stock hint
-    return None, ("in stock" in h.lower())
+    qh, stock_hint = parse_html_hurry(r.text)
+    if qh is not None:
+        return qh, (qh > 0)
+    return None, bool(stock_hint) if stock_hint is not None else None
 
 # =============== MONITOR LOOP ===============
 def main():
@@ -296,25 +308,25 @@ def main():
             qty, in_stock = get_quantity_and_stock(PRODUCT_URL)
             print(f"[now] qty={qty} in_stock={in_stock} | last qty={prev_qty} last stock={prev_stock}")
 
-            changed = False
+            # Robust change detection
+            stock_flip = (in_stock is not None and prev_stock is not None and in_stock != prev_stock)
+            qty_changed = (qty is not None and qty != prev_qty)
+            qty_zero_now = (qty == 0) or (in_stock is False)
+
+            changed = stock_flip or qty_changed or (prev_qty not in (None, 0) and qty_zero_now)
+
             title = None
-
-            # Stock flip?
-            if (in_stock is not None and prev_stock is not None) and (in_stock != prev_stock):
-                changed = True
-                title = "Product Back in Stock" if in_stock else "Product Out of Stock"
-
-            # Quantity change?
-            if qty is not None and qty != prev_qty:
-                changed = True
-                if qty == 0:
-                    title = "Product Out of Stock"
-                elif prev_qty is None:
-                    title = title or "Quantity Observed"
+            if qty_zero_now:
+                title = "Product Out of Stock"
+            elif stock_flip and in_stock:
+                title = "Product Back in Stock"
+            elif qty_changed:
+                if prev_qty is None:
+                    title = "Quantity Observed"
                 else:
-                    title = title or "Quantity Updated"
+                    title = "Quantity Updated"
 
-            if changed:
+            if changed and title:
                 notify(title, prev_qty, qty, bool(in_stock))
                 prev_qty, prev_stock = qty, in_stock
                 save_state({"qty": prev_qty, "in_stock": prev_stock})
@@ -322,6 +334,7 @@ def main():
                 print("[no-change] no notification")
 
         except requests.exceptions.RequestException as e:
+            # Render free tier sometimes yields transient network issues
             print("[network] error:", e)
         except Exception as e:
             print("[loop] error:", e)
