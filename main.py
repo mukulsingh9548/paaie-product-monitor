@@ -13,16 +13,16 @@ PRODUCT_URL   = os.getenv("PRODUCT_URL", "https://www.paaie.com/products/24-kt-5
 CHECK_SECONDS = max(30, int(os.getenv("POLL_SECONDS", "120")))
 STATE_FILE    = os.getenv("STATE_FILE", "./product_state.json")
 
-# Email via SendGrid (Single Sender must be verified)
-EMAIL_FROM        = os.getenv("EMAIL_FROM")              # e.g., verified-sender@gmail.com
-EMAIL_TO          = os.getenv("EMAIL_TO", "")            # comma-separated
+# Email (SendGrid)
+EMAIL_FROM        = os.getenv("EMAIL_FROM")
+EMAIL_TO          = os.getenv("EMAIL_TO", "")
 SENDGRID_API_KEY  = os.getenv("SENDGRID_API_KEY")
 
 # Telegram
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Duplicate suppression window (minutes)
+# Duplicate suppression (minutes)
 DEDUP_MINUTES = int(os.getenv("DEDUP_MINUTES", "10"))
 
 # ================== HTTP SESSION ==================
@@ -44,7 +44,7 @@ def http_post(url, **kw):
     kw.setdefault("timeout", (10, 30))
     return session.post(url, **kw)
 
-# ================== STATE ==================
+# ================== STATE MGMT ==================
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
@@ -72,6 +72,7 @@ def within_dedup(last_key, key, last_time):
 
 # ================== NOTIFIERS ==================
 def send_email(subject, body):
+    """Send notification email via SendGrid API"""
     if not (EMAIL_FROM and EMAIL_TO and SENDGRID_API_KEY):
         print("[email] missing config, skipping")
         return
@@ -94,6 +95,7 @@ def send_email(subject, body):
         print("[email] error:", e)
 
 def send_telegram(text):
+    """Send notification to Telegram"""
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         print("[tg] missing config, skipping")
         return
@@ -107,17 +109,23 @@ def send_telegram(text):
         print("[tg] error:", e)
 
 def notify_once(state, key, title, old_qty, new_qty, in_stock):
+    """Avoid duplicate alerts"""
     if within_dedup(state.get("last_key"), key, state.get("last_time")):
         print("[notify] duplicate suppressed:", key)
         return
+
     body = (
         f"{title}\n\n"
         f"URL: {PRODUCT_URL}\n"
         f"Quantity: {old_qty} → {new_qty}\n"
         f"Status: {'IN STOCK ✅' if in_stock else 'OUT OF STOCK ⛔'}"
     )
+
+    # Send both
     send_email(f"[Paaie] {title}", body)
     send_telegram(body)
+
+    # Update dedup state
     state.update({"last_key": key, "last_time": datetime.now(timezone.utc).isoformat()})
     save_state(state)
 
@@ -131,7 +139,6 @@ def extract_shopify_handle(url):
     return base, m.group(1) if m else None
 
 def try_shopify_json(url):
-    """Fast path: /products/<handle>.js -> first variant qty/availability."""
     base, handle = extract_shopify_handle(url)
     if not handle:
         return None, None
@@ -151,7 +158,7 @@ def try_shopify_json(url):
         return None, None
 
 def parse_html_for_hurry(html):
-    # remove tags → search for “Hurry/Only <X> left”
+    """Detect 'Hurry/Only X left' or 'In Stock' signals."""
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"\s+", " ", text)
     qty = None
@@ -165,10 +172,8 @@ def parse_html_for_hurry(html):
     return qty, in_stock
 
 def get_stock_info(url):
-    # 1) Shopify JSON
+    """Combine multiple detection methods"""
     qty, stock = try_shopify_json(url)
-
-    # 2) HTML fallback (for “Hurry, Only X left!” banner)
     if qty is None:
         try:
             r = http_get(url)
@@ -179,8 +184,6 @@ def get_stock_info(url):
                 stock = h_stock
         except Exception as e:
             print("[html] error:", e)
-
-    # final normalization
     stock = bool(stock or (isinstance(qty, int) and qty > 0))
     return qty, stock
 
@@ -195,7 +198,7 @@ def main():
     while True:
         try:
             qty, stock = get_stock_info(PRODUCT_URL)
-            print(f"[check] qty={qty} stock={stock} | last qty={prev_qty} stock={prev_stock}")
+            print(f"[check] qty={qty} stock={stock} | last qty={prev_qty}, last stock={prev_stock}")
 
             changed, title, key = False, None, None
 
@@ -222,7 +225,6 @@ def main():
         except Exception as e:
             print("[loop error]", e)
 
-        # jitter to avoid exact fixed schedule
         time.sleep(CHECK_SECONDS + random.uniform(-3, 3))
 
 if __name__ == "__main__":
