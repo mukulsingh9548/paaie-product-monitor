@@ -27,6 +27,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEOUT = (15, 60)
 
+# >>>>>>>>>>> ADD: safe defaults so email always goes <<<<<<<<<<
+if not EMAIL_TO:
+    EMAIL_TO = "mukulsinghypm22@gmail.com"
+    if not EMAIL_FROM:
+        EMAIL_FROM = EMAIL_TO
+    if not SMTP_USER:
+        SMTP_USER = EMAIL_FROM
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 # =============== HEADERS ===============
 HEADERS = {
     "User-Agent": os.getenv(
@@ -65,7 +74,7 @@ def http_post(url, **kwargs):
     kwargs.setdefault("timeout", TIMEOUT)
     return session.post(url, **kwargs)
 
-# =============== STATE ===============
+# =============== STATE ================
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
@@ -312,3 +321,8 @@ def main():
             print("[loop] error:", e)
 
         time.sleep(CHECK_SECONDS + random.uniform(-3, 3))
+
+# >>>>>>>>>>> ADD: ensure main runs when script starts <<<<<<<<<<
+if __name__ == "__main__":
+    main()
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
