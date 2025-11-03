@@ -1,6 +1,5 @@
-import threading, signal, sys, os, requests, smtplib, ssl
+import threading, signal, sys, os, requests
 from flask import Flask, Response
-from email.message import EmailMessage
 
 app = Flask(__name__)
 _started = False  # ensure single start per process
@@ -31,67 +30,37 @@ def healthz():
     start_monitor_once()
     return {"ok": True}, 200
 
-# ------------------------------- email (SendGrid first, SMTP fallback) -----
+# ------------------------------- email (SendGrid only) ---------------------
 def _send_email_safe(subject: str, body: str):
-    sg_key = os.environ.get("SENDGRID_API_KEY")
-    email_to = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
-    email_from = os.environ.get("SMTP_USER") or os.environ.get("EMAIL_FROM") or email_to
+    sg_key     = os.environ.get("SENDGRID_API_KEY")
+    email_to   = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
+    email_from = os.environ.get("EMAIL_FROM") or os.environ.get("SMTP_USER") or email_to
 
-    # Prefer HTTP via SendGrid to avoid outbound SMTP blocks
-    if sg_key and email_to:
-        try:
-            to_list = [e.strip() for e in str(email_to).split(",") if e.strip()]
-            payload = {
-                "personalizations": [{"to": [{"email": e} for e in to_list]}],
-                "from": {"email": email_from},
-                "subject": subject,
-                "content": [{"type": "text/plain", "value": body}],
-            }
-            r = requests.post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers={"Authorization": f"Bearer {sg_key}", "Content-Type": "application/json"},
-                json=payload, timeout=10
-            )
+    if not (sg_key and email_from and email_to):
+        print("[TEST_NOTIFY] Email skipped (missing SENDGRID_API_KEY/EMAIL_FROM/EMAIL_TO).")
+        return
+
+    to_list = [{"email": e.strip()} for e in str(email_to).split(",") if e.strip()]
+    payload = {
+        "personalizations": [{"to": to_list}],
+        "from": {"email": email_from, "name": "Paaie Product Monitor"},
+        "reply_to": {"email": email_from},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
+
+    try:
+        r = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {sg_key}", "Content-Type": "application/json"},
+            json=payload, timeout=15
+        )
+        if 200 <= r.status_code < 300:
             print(f"[TEST_NOTIFY] Email via SendGrid: {r.status_code}")
-            if 200 <= r.status_code < 300:
-                return
-            else:
-                print("[TEST_NOTIFY] SendGrid non-2xx, trying SMTP fallback…")
-        except Exception as e:
-            print(f"[TEST_NOTIFY] SendGrid failed: {e}; trying SMTP...")
-
-    # SMTP fallback
-    smtp_user = os.environ.get("SMTP_USER")
-    smtp_pass = os.environ.get("SMTP_PASS")
-    host      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-
-    if not (smtp_user and smtp_pass and email_to):
-        print("[TEST_NOTIFY] ⚠️ Email skipped (missing env vars).")
-        return
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = email_to
-    msg.set_content(body)
-
-    try:
-        with smtplib.SMTP(host, 587, timeout=10) as s:
-            s.starttls(context=ssl.create_default_context())
-            s.login(smtp_user, smtp_pass)
-            s.send_message(msg)
-        print("[TEST_NOTIFY] ✅ Email sent via 587 STARTTLS.")
-        return
+        else:
+            print(f"[TEST_NOTIFY] SendGrid error: {r.status_code} body={r.text}")
     except Exception as e:
-        print(f"[TEST_NOTIFY] 587 failed: {e}; retrying 465/SSL...")
-
-    try:
-        with smtplib.SMTP_SSL(host, 465, context=ssl.create_default_context(), timeout=10) as s:
-            s.login(smtp_user, smtp_pass)
-            s.send_message(msg)
-        print("[TEST_NOTIFY] ✅ Email sent via 465 SSL.")
-    except Exception as e2:
-        print(f"[TEST_NOTIFY] ❌ Email failed on both ports: {e2}")
+        print(f"[TEST_NOTIFY] SendGrid exception: {e}")
 
 # ------------------------------- test route --------------------------------
 @app.route("/_test_notify")
