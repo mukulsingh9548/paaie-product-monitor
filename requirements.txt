@@ -1,5 +1,5 @@
 Flask
-gunicorn
 requests
+gunicorn
 urllib3
 python-dotenv
