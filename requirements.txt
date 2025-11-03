@@ -1,5 +1,5 @@
+Flask
+gunicorn
 requests
 urllib3
 python-dotenv
-gunicorn
-Flask
