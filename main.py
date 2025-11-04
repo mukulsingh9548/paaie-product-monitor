@@ -320,158 +320,229 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os, re, time, json, requests
-from email.mime.text import MIMEText
 from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ====== ENV / CONFIG ======
+# ========= ENV / CONFIG =========
 PRODUCT_URL = os.getenv("PRODUCT_URL", "https://www.paaie.com/products/24-kt-5-gram-fortuna-pamp-gold-bar-testing")
+POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "90")))
+STATE_FILE   = os.getenv("STATE_FILE", "./paaie_state.json")
+FIRST_NOTIFY = os.getenv("FIRST_NOTIFY", "1") == "1"
 
+# Email via SendGrid (HTTP; SMTP not needed)
 EMAIL_TO   = os.getenv("EMAIL_TO",   "mukulsinghmtr@gmail.com").strip()
-EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_TO).strip()   # MUST be a verified sender in SendGrid
+EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_TO).strip()           # must be verified in SendGrid
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 
+# Telegram
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-STATE_FILE     = os.getenv("STATE_FILE", "paaie_state.json")
-POLL_SECONDS   = max(10, int(os.getenv("POLL_SECONDS", "90")))
-TIMEOUT        = (15, 60)
-
+TIMEOUT = (15, 60)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124",
-    "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": os.getenv("USER_AGENT","Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+AJAX_HEADERS = {
+    **HEADERS,
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
 }
 
 def make_session():
     s = requests.Session()
-    retry = Retry(total=6, connect=4, read=4, backoff_factor=1.6,
-                  status_forcelist=[429,500,502,503,504])
+    retry = Retry(total=6, connect=4, read=4, backoff_factor=2, status_forcelist=[429,500,502,503,504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.mount("http://",  HTTPAdapter(max_retries=retry))
     return s
-SESSION = make_session()
+S = make_session()
 
-# ====== EMAIL (SendGrid ONLY) ======
+# ========= NOTIFIERS =========
 def send_email(subject: str, body: str):
     if not SENDGRID_API_KEY:
-        print("🚫 SENDGRID_API_KEY missing: email skipped"); return
-    payload = {
-        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
-        "from": {"email": EMAIL_FROM},  # must be VERIFIED in SendGrid
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": body}],
-    }
+        print("🚫 SENDGRID_API_KEY missing → email skipped"); return
     try:
-        r = SESSION.post(
+        r = S.post(
             "https://api.sendgrid.com/v3/mail/send",
-            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
-                     "Content-Type": "application/json"},
-            json=payload, timeout=20
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "personalizations": [{"to": [{"email": EMAIL_TO}]}],
+                "from": {"email": EMAIL_FROM},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            },
+            timeout=20,
         )
         print(f"📨 SendGrid status: {r.status_code}")
-        if 200 <= r.status_code < 300:
-            print(f"✅ Email sent via SendGrid → {EMAIL_TO}")
-        else:
-            print("❌ SendGrid response:", r.text[:200])
     except Exception as e:
-        print("❌ SendGrid error:", e)
+        print("❌ Email failed:", e)
 
-# ====== TELEGRAM ======
 def send_telegram(text: str):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        print("⚠️ Telegram not configured; skipping"); return
+        print("⚠️ Telegram not configured; skip"); return
     try:
-        r = SESSION.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
-        )
+        r = S.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                   json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=12)
         print("📲 Telegram status:", r.status_code)
     except Exception as e:
-        print("❌ Telegram error:", e)
+        print("❌ Telegram failed:", e)
 
-# ====== STATE ======
+def notify(title: str, qty, in_stock: bool):
+    body = f"{title}\n\nURL: {PRODUCT_URL}\nQuantity: {qty}\nStatus: {'IN STOCK ✅' if in_stock else 'OUT OF STOCK ⛔'}"
+    send_email(title, body)
+    send_telegram(body)
+
+# ========= STATE =========
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(STATE_FILE,"r",encoding="utf-8") as f: return json.load(f)
     except Exception: pass
     return {"qty": None, "in_stock": None}
 
 def save_state(st):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(st, f, indent=2)
+    with open(STATE_FILE,"w",encoding="utf-8") as f: json.dump(st,f,indent=2)
 
-# ====== PARSING ======
-def extract_handle(url: str):
+# ========= PARSERS =========
+HURRY = [
+    re.compile(r"(?i)\bhurry[^0-9]{0,40}(\d{1,3}(?:,\d{3})*)\s*(left|remain(?:ing)?)"),
+    re.compile(r"(?i)\bonly[^0-9]{0,20}(\d{1,3}(?:,\d{3})*)\s*left"),
+]
+SOLD = [
+    re.compile(r"(?i)\bsold\s*out\b"),
+    re.compile(r"(?i)\bout\s*of\s*stock\b"),
+    re.compile(r"(?i)\bcurrently\s*unavailable\b"),
+]
+
+def extract_base_handle(url: str):
     u = urlparse(url)
     base = f"{u.scheme}://{u.netloc}"
     m = re.search(r"/products/([^/?#]+)", u.path)
     return base, (m.group(1) if m else None)
 
-def get_qty_stock(url: str):
-    base, handle = extract_handle(url)
-    # 1) product.json
+def product_variants(url: str):
+    base, handle = extract_base_handle(url)
+    r = S.get(f"{base}/products/{handle}.js", headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
+    return base, j.get("variants") or []
+
+def choose_variant(url: str):
     try:
-        r = SESSION.get(f"{base}/products/{handle}.js", headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-            v = next((x for x in data["variants"] if x.get("available")), data["variants"][0])
-            vid = v["id"]
-            vres = SESSION.get(f"{base}/variants/{vid}.json", headers=HEADERS, timeout=TIMEOUT)
-            if vres.status_code == 200:
-                variant = vres.json().get("variant", {})
-                qty = variant.get("inventory_quantity")
-                if isinstance(qty, int) and qty < 0: qty = 0
-                in_stock = bool(variant.get("available", v.get("available", False)))
-                return qty, in_stock
+        base, variants = product_variants(url)
+        if not variants: return base, None
+        v = next((x for x in variants if x.get("available")), variants[0])
+        return base, int(v["id"])
     except Exception as e:
         print("⚠️ product JSON error:", e)
+        base, _ = extract_base_handle(url)
+        return base, None
 
-    # 2) HTML fallback
+def cart_probe_qty(base: str, product_url: str, variant_id: int):
     try:
-        h = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT).text.lower()
-        if any(x in h for x in ["sold out", "out of stock", "currently unavailable"]):
+        ajax = dict(AJAX_HEADERS); ajax["Origin"]=base; ajax["Referer"]=product_url
+        S.post(f"{base}/cart/clear.js", headers=ajax, timeout=TIMEOUT)
+        add = S.post(f"{base}/cart/add.js", headers=ajax, data={"id": str(variant_id), "quantity": "1"}, timeout=TIMEOUT)
+        if add.status_code >= 400: return None, False
+        # push to max to learn ceiling
+        S.post(f"{base}/cart/change.js", headers=ajax, data={"id": str(variant_id), "quantity": "999"}, timeout=TIMEOUT)
+        cart = S.get(f"{base}/cart.js", headers=ajax, timeout=TIMEOUT).json()
+        S.post(f"{base}/cart/clear.js", headers=ajax, timeout=TIMEOUT)
+        for it in cart.get("items", []):
+            if str(it.get("variant_id") or it.get("id")) == str(variant_id):
+                q = int(it.get("quantity",0))
+                if q >= 999:  # backorder mode
+                    return None, True
+                return q, q>0
+    except Exception as e:
+        print("⚠️ cart probe error:", e)
+    return None, None
+
+def variant_json_qty(base: str, vid: int):
+    try:
+        v = S.get(f"{base}/variants/{vid}.json", headers=HEADERS, timeout=TIMEOUT)
+        if v.status_code == 200:
+            j = v.json().get("variant", {})
+            qty = j.get("inventory_quantity")
+            if isinstance(qty,int) and qty<0: qty=0
+            return qty, bool(j.get("available", False))
+    except Exception as e:
+        print("⚠️ variant.json error:", e)
+    return None, None
+
+def html_fallback(url: str):
+    try:
+        h = S.get(url, headers=HEADERS, timeout=TIMEOUT).text
+        s = re.sub(r"<(script|style)\b[^>]*>.*?</\1>"," ",h,flags=re.S|re.I)
+        s = re.sub(r"<[^>]+>"," ",s); s = re.sub(r"\s+"," ",s).strip()
+        for pat in HURRY:
+            m = pat.search(s)
+            if m:
+                q = int(m.group(1).replace(",",""))
+                return q, q>0
+        if any(p.search(s) for p in SOLD):
             return 0, False
-        if "add to cart" in h or "in stock" in h:
-            # try to parse "only X left"
-            m = re.search(r"(only|hurry)[^0-9]{0,20}(\d+)\s*left", h)
-            if m: 
-                q = int(m.group(2)); return q, q > 0
+        if "add to cart" in s.lower() or "in stock" in s.lower():
             return None, True
     except Exception as e:
         print("⚠️ html fallback error:", e)
     return None, None
 
-def notify(title, qty):
-    msg = f"{title}\nCurrent quantity: {qty}\n{PRODUCT_URL}"
-    send_email(title, msg)
-    send_telegram(msg)
+def get_qty_and_stock(url: str):
+    base, vid = choose_variant(url)
+    # A) try variant.json
+    if vid:
+        qty, avail = variant_json_qty(base, vid)
+        if qty is not None or avail is not None:
+            return qty, bool(avail if avail is not None else (qty and qty>0))
+        # B) cart probe
+        q2, s2 = cart_probe_qty(base, url, vid)
+        if q2 is not None or s2 is not None:
+            return q2, bool(s2)
+    # C) html fallback
+    return html_fallback(url)
 
-# ====== MAIN LOOP ======
+# ========= MAIN LOOP =========
 def main():
-    print("🚀 Paaie Product Monitor started"); print("🔗", PRODUCT_URL)
-    st = load_state(); prev_qty = st.get("qty"); prev_stock = st.get("in_stock")
+    print("🚀 Paaie Product Monitor started")
+    print("🔗", PRODUCT_URL)
+    st = load_state()
+    prev_qty, prev_stock = st.get("qty"), st.get("in_stock")
+
+    if FIRST_NOTIFY:
+        try:
+            q, s = get_qty_and_stock(PRODUCT_URL)
+            notify("Initial observation", q, bool(s))
+            prev_qty, prev_stock = q, s
+            save_state({"qty": prev_qty, "in_stock": prev_stock})
+        except Exception as e:
+            print("[init] error:", e)
 
     while True:
         try:
-            qty, in_stock = get_qty_stock(PRODUCT_URL)
+            qty, in_stock = get_qty_and_stock(PRODUCT_URL)
             print(f"📊 Now qty={qty} | stock={in_stock} | prev qty={prev_qty} stock={prev_stock}")
 
             changed = False; title = None
+            # robust out-of-stock
             if (qty == 0) or (in_stock is False):
                 changed = (prev_stock is not False) or (prev_qty not in (0, None))
-                title = "🔴 Product Out of Stock!"
+                title = "Product Out of Stock"
             elif (in_stock is True) and (prev_stock is not True):
-                changed = True; title = "🟢 Product Back in Stock!"
-            elif (qty is not None and qty != prev_qty):
-                changed = True; title = "🔔 Quantity Updated!"
+                changed = True; title = "Product Back in Stock"
+            elif (isinstance(qty,int) and qty != prev_qty):
+                changed = True; title = "Quantity Updated"
 
             if changed and title:
-                notify(title, qty)
+                notify(title, qty, bool(in_stock))
                 prev_qty, prev_stock = qty, in_stock
                 save_state({"qty": prev_qty, "in_stock": prev_stock})
             else:
@@ -483,3 +554,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
